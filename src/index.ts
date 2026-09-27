@@ -23,19 +23,24 @@ const EnvSchema = z.object({
   ODOO_SH_SSH_PORT: z.coerce.number().positive().optional().default(22),
   ODOO_SH_SSH_USER: z.string().min(1, 'ODOO_SH_SSH_USER is required'),
   ODOO_SH_SSH_KEY_PATH: z.string().min(1, 'ODOO_SH_SSH_KEY_PATH is required'),
-  ODOO_SH_SSH_PASSPHRASE: z.string().optional(),
+  ODOO_SH_SSH_KNOWN_HOSTS: z.string().optional(),
+  ODOO_SH_SSH_STRICT_HOST_KEY: z.enum(['yes', 'accept-new']).optional().default('accept-new'),
+  ODOO_SH_DATABASE: z.string().optional(),
+  // Read-only unless explicitly disabled: shell, file and git write tools are not even listed.
+  ODOO_SH_READ_ONLY: z
+    .enum(['true', 'false', '1', '0'])
+    .optional()
+    .default('true')
+    .transform((v) => v === 'true' || v === '1'),
   SSH_TIMEOUT: z.coerce.number().positive().optional().default(30000),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).optional().default('info'),
 });
 
 const env = EnvSchema.parse(process.env);
 
-// Debug: Log configuration
-console.error('SSH Config:', {
-  host: env.ODOO_SH_SSH_HOST,
-  user: env.ODOO_SH_SSH_USER,
-  keyPath: env.ODOO_SH_SSH_KEY_PATH,
-});
+console.error(
+  `Odoo.sh MCP: ${env.ODOO_SH_SSH_USER}@${env.ODOO_SH_SSH_HOST} (${env.ODOO_SH_READ_ONLY ? 'read-only' : 'READ-WRITE'})`
+);
 
 // Initialize Odoo.sh SSH client
 const odooClient = new OdooShSSHClient({
@@ -43,9 +48,25 @@ const odooClient = new OdooShSSHClient({
   port: env.ODOO_SH_SSH_PORT,
   username: env.ODOO_SH_SSH_USER,
   privateKeyPath: env.ODOO_SH_SSH_KEY_PATH,
-  passphrase: env.ODOO_SH_SSH_PASSPHRASE,
+  knownHostsPath: env.ODOO_SH_SSH_KNOWN_HOSTS,
+  strictHostKeyChecking: env.ODOO_SH_SSH_STRICT_HOST_KEY,
+  odooDatabase: env.ODOO_SH_DATABASE,
   timeout: env.SSH_TIMEOUT,
+  debug: env.LOG_LEVEL === 'debug',
 });
+
+// Tools that change the build (code, git or database). Hidden and refused in read-only mode.
+const WRITE_TOOLS = new Set([
+  'trigger_build',
+  'execute_odoo_shell',
+  'write_file',
+  'create_directory',
+  'git_add',
+  'git_commit',
+  'git_push',
+  'git_checkout',
+  'git_pull',
+]);
 
 // Create MCP server
 const server = new Server(
@@ -64,8 +85,7 @@ const server = new Server(
 
 // TOOLS
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
+  const tools = [
       {
         name: 'get_project_info',
         description: 'Get information about the connected Odoo.sh project (via SSH)',
@@ -309,20 +329,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
-    ],
+  ];
+  return {
+    tools: env.ODOO_SH_READ_ONLY ? tools.filter((t) => !WRITE_TOOLS.has(t.name)) : tools,
   };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const { name, arguments: args } = request.params;
-    console.error(`[DEBUG] Tool called: ${name}`, args);
+    if (env.LOG_LEVEL === 'debug') console.error(`[DEBUG] Tool called: ${name}`);
+
+    if (env.ODOO_SH_READ_ONLY && WRITE_TOOLS.has(name)) {
+      throw new Error(`Tool '${name}' is disabled: server runs with ODOO_SH_READ_ONLY=true`);
+    }
 
     switch (name) {
       case 'get_project_info': {
-        console.error('[DEBUG] Executing get_project_info');
         const info = await odooClient.getProjectInfo();
-        console.error('[DEBUG] Project info result:', info);
         return {
           content: [
             {

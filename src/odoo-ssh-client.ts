@@ -1,20 +1,24 @@
 import { z } from 'zod';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Configuration schema
 const ConfigSchema = z.object({
-  host: z.string().min(1, 'SSH host is required'),
-  port: z.number().positive().default(22),
-  username: z.string().min(1, 'SSH username is required'),
+  host: z.string().regex(/^[A-Za-z0-9.-]+$/, 'SSH host must be a plain hostname'),
+  port: z.number().int().positive().default(22),
+  username: z.string().regex(/^[A-Za-z0-9._-]+$/, 'SSH user must be a plain username (the build ID on Odoo.sh)'),
   privateKeyPath: z.string().min(1, 'SSH private key path is required'),
-  passphrase: z.string().optional(),
+  knownHostsPath: z.string().optional(),
+  strictHostKeyChecking: z.enum(['yes', 'accept-new']).default('accept-new'),
+  odooDatabase: z.string().regex(/^[A-Za-z0-9._-]*$/).optional(),
   timeout: z.number().positive().default(30000),
+  debug: z.boolean().default(false),
 });
 
-type Config = z.infer<typeof ConfigSchema>;
+export type Config = z.input<typeof ConfigSchema>;
+type ParsedConfig = z.infer<typeof ConfigSchema>;
 
 // Response types
 export interface ProjectInfo {
@@ -49,194 +53,179 @@ export interface LogEntry {
   message: string;
 }
 
+/**
+ * Quote a value for the remote POSIX shell. Everything between single quotes is literal;
+ * embedded single quotes are closed, escaped and reopened.
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Git ref names: no option injection, no revision syntax. */
+export function assertBranch(branch: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch) || branch.includes('..') || branch.length > 200) {
+    throw new Error(`Invalid branch name: ${branch}`);
+  }
+  return branch;
+}
+
+/** Paths relative to ~/src/user: no absolute paths, no traversal, no option injection. */
+export function assertRelativePath(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  if (
+    !normalized ||
+    normalized.startsWith('/') ||
+    normalized.startsWith('~') ||
+    normalized.startsWith('-') ||
+    normalized.split('/').some((part) => part === '..') ||
+    normalized.includes('\0')
+  ) {
+    throw new Error(`Invalid path (must be relative to ~/src/user, without '..'): ${path}`);
+  }
+  return normalized;
+}
+
+export function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+const REPO = 'cd ~/.repositories/git_*';
+const USER_SRC = 'cd ~/src/user';
+
 export class OdooShSSHClient {
-  private config: Config;
+  private config: ParsedConfig;
 
   constructor(config: Config) {
     this.config = ConfigSchema.parse(config);
   }
 
-  /**
-   * Execute a command via SSH and return the output
-   * Uses OpenSSH directly via subprocess since Node.js ssh2 library has packet type 91 issues with Odoo.sh
-   */
-  private async executeCommand(command: string): Promise<string> {
-    console.error(`[SSH DEBUG] Executing command: ${command}`);
-    
-    try {
-      // Escape special characters for the SSH command
-      // % doesn't need escaping because the command runs on remote Linux
-      // But we need to escape quotes, and use PowerShell to avoid $ issues
-      const escapedCommand = command.replace(/"/g, '\\"');
-      
-      // Build OpenSSH command
-      const sshCommand = `ssh -i "${this.config.privateKeyPath}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL ${this.config.username}@${this.config.host} "${escapedCommand}"`;
-      
-      console.error(`[SSH DEBUG] Running: ${sshCommand}`);
-      
-      const { stdout, stderr } = await execAsync(sshCommand, {
-        timeout: this.config.timeout,
-        maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-        // Use default shell (cmd.exe) - we escape $ as $$ in commands
-      });
-      
-      console.error(`[SSH DEBUG] Command completed`);
-      console.error(`[SSH DEBUG] Output: ${stdout.substring(0, 200)}...`);
-      if (stderr) console.error(`[SSH DEBUG] Stderr: ${stderr}`);
-      
-      return stdout;
-    } catch (err: any) {
-      console.error(`[SSH DEBUG] Error: ${err.message}`);
-      if (err.stdout) {
-        console.error(`[SSH DEBUG] Partial stdout: ${err.stdout}`);
-      }
-      if (err.stderr) {
-        console.error(`[SSH DEBUG] Stderr: ${err.stderr}`);
-      }
-      throw new Error(`SSH command failed: ${err.message}`);
+  private debug(message: string): void {
+    if (this.config.debug) console.error(`[SSH DEBUG] ${message}`);
+  }
+
+  /** Arguments passed to the local `ssh` binary (no local shell involved). */
+  buildSshArgs(remoteCommand: string): string[] {
+    const args = [
+      '-i', this.config.privateKeyPath,
+      '-p', String(this.config.port),
+      '-o', 'BatchMode=yes',
+      '-o', 'IdentitiesOnly=yes',
+      '-o', `StrictHostKeyChecking=${this.config.strictHostKeyChecking}`,
+      '-o', `ConnectTimeout=${Math.ceil(this.config.timeout / 1000)}`,
+    ];
+    if (this.config.knownHostsPath) {
+      args.push('-o', `UserKnownHostsFile=${this.config.knownHostsPath}`);
     }
+    args.push('-l', this.config.username, '--', this.config.host, remoteCommand);
+    return args;
   }
 
   /**
-   * Get project information
+   * Execute a command on the Odoo.sh build via the OpenSSH client.
+   * The remote command is a single argv entry, so nothing is interpreted by a local shell;
+   * every user-supplied value inside it must go through shellQuote() or a validator.
    */
+  private async executeCommand(command: string): Promise<string> {
+    this.debug(`Executing: ${command.length > 300 ? command.slice(0, 300) + '…' : command}`);
+    try {
+      const { stdout, stderr } = await execFileAsync('ssh', this.buildSshArgs(command), {
+        timeout: this.config.timeout,
+        maxBuffer: 10 * 1024 * 1024,
+        windowsHide: true,
+      });
+      if (stderr) this.debug(`stderr: ${stderr.slice(0, 500)}`);
+      return stdout;
+    } catch (err: any) {
+      const stderr = typeof err.stderr === 'string' ? err.stderr.trim() : '';
+      throw new Error(`SSH command failed (exit ${err.code ?? '?'}): ${stderr || err.message}`);
+    }
+  }
+
   async getProjectInfo(): Promise<ProjectInfo> {
-    // Find git repository and get remote URL
-    const remoteUrl = await this.executeCommand('cd ~/.repositories/git_* && git remote get-url origin');
-    
-    // Get all branches
-    const branchesOutput = await this.executeCommand('cd ~/.repositories/git_* && git branch -r | grep -v HEAD');
+    const remoteUrl = await this.executeCommand(`${REPO} && git remote get-url origin`);
+    const branchesOutput = await this.executeCommand(`${REPO} && git branch -r | grep -v HEAD`);
     const branches = branchesOutput
       .split('\n')
-      .filter(b => b.trim())
-      .map(b => b.trim().replace('origin/', ''));
-
-    // Extract project name from remote URL
-    const nameMatch = remoteUrl.match(/\/([^\/]+)\.git/);
-    const name = nameMatch ? nameMatch[1] : 'unknown';
-
+      .filter((b) => b.trim())
+      .map((b) => b.trim().replace('origin/', ''));
+    const nameMatch = remoteUrl.match(/\/([^/]+?)(\.git)?\s*$/);
     return {
-      name,
+      name: nameMatch ? nameMatch[1] : 'unknown',
       repository: remoteUrl.trim(),
       branches,
     };
   }
 
-  /**
-   * List all Git branches
-   */
   async listBranches(): Promise<BranchInfo[]> {
-    // Use simple git branch command
-    const branchOutput = await this.executeCommand(
-      'cd ~/.repositories/git_* && git branch -r'
+    const output = await this.executeCommand(
+      `${REPO} && git for-each-ref refs/remotes/origin --format='%(refname:short)%09%(objectname:short)%09%(subject)'`
     );
-    
-    return branchOutput
+    return output
       .split('\n')
-      .filter(line => line.trim() && !line.includes('HEAD'))
-      .map(line => {
-        const name = line.trim().replace('origin/', '');
+      .filter((line) => line.trim() && !line.startsWith('origin/HEAD'))
+      .map((line) => {
+        const [ref, commit, ...subject] = line.split('\t');
         return {
-          name,
+          name: ref.replace(/^origin\//, ''),
           current: false,
-          lastCommit: 'N/A',
-          lastCommitMessage: 'N/A',
+          lastCommit: commit ?? '',
+          lastCommitMessage: subject.join('\t'),
         };
       });
   }
 
-  /**
-   * Get current branch information
-   */
   async getCurrentBranch(): Promise<string> {
-    const output = await this.executeCommand('cd ~/.repositories/git_* && git rev-parse --abbrev-ref HEAD');
+    const output = await this.executeCommand(`${USER_SRC} && git rev-parse --abbrev-ref HEAD`);
     return output.trim();
   }
 
-  /**
-   * Get build/commit history for a branch
-   */
   async getBuildHistory(branch: string, limit: number = 10): Promise<BuildInfo[]> {
-    // Get list of commit hashes first
-    const hashesOutput = await this.executeCommand(
-      `cd ~/.repositories/git_* && git log origin/${branch} -${limit} --format=%H`
+    const ref = shellQuote(`origin/${assertBranch(branch)}`);
+    const n = clampInt(limit, 10, 1, 100);
+    const output = await this.executeCommand(
+      `${REPO} && git log ${ref} -n ${n} --format='%H%x1f%an%x1f%ai%x1f%s'`
     );
-    
-    const hashes = hashesOutput.split('\n').filter(h => h.trim());
-    const result: BuildInfo[] = [];
-    
-    // Get details for each commit separately to avoid % escaping issues
-    for (const hash of hashes) {
-      try {
-        const author = await this.executeCommand(
-          `cd ~/.repositories/git_* && git show -s --format=%an ${hash}`
-        );
-        const date = await this.executeCommand(
-          `cd ~/.repositories/git_* && git show -s --format=%ai ${hash}`
-        );
-        const message = await this.executeCommand(
-          `cd ~/.repositories/git_* && git show -s --format=%s ${hash}`
-        );
-        
-        result.push({
-          commit: hash.trim(),
-          author: author.trim(),
-          date: date.trim(),
-          message: message.trim(),
-        });
-      } catch (err) {
-        console.error(`[SSH DEBUG] Could not get info for commit ${hash}: ${(err as Error).message}`);
-      }
-    }
-    
-    return result;
+    return output
+      .split('\n')
+      .filter((line) => line.trim())
+      .map((line) => {
+        const [commit, author, date, message] = line.split('\x1f');
+        return { commit, author, date, message };
+      });
   }
 
-  /**
-   * List databases
-   */
   async listDatabases(): Promise<DatabaseInfo[]> {
     try {
-      // Try to list PostgreSQL databases
       const output = await this.executeCommand(
-        'psql -l -t | awk \'{print $1"|"$7}\' | grep -v "^|"'
+        `psql -At -d postgres -c "select datname, pg_size_pretty(pg_database_size(datname)) from pg_database where not datistemplate"`
       );
-
       return output
         .split('\n')
-        .filter(line => line.trim() && !line.includes('template'))
-        .map(line => {
+        .filter((line) => line.trim())
+        .map((line) => {
           const [name, size] = line.split('|');
-          return {
-            name: name.trim(),
-            size: size ? size.trim() : 'unknown',
-          };
+          return { name: name.trim(), size: size ? size.trim() : 'unknown' };
         });
-    } catch (err) {
-      // Fallback: return empty list if psql is not available
+    } catch {
       return [];
     }
   }
 
-  /**
-   * Get Odoo logs
-   */
   async getLogs(logType: 'odoo' | 'install' | 'pip' = 'odoo', lines: number = 100): Promise<LogEntry[]> {
-    const logFile = logType === 'odoo' ? '~/logs/odoo.log' : 
-                    logType === 'install' ? '~/logs/install.log' : 
-                    '~/logs/pip.log';
-
+    const files = { odoo: '~/logs/odoo.log', install: '~/logs/install.log', pip: '~/logs/pip.log' };
+    const logFile = files[logType];
+    if (!logFile) throw new Error(`Invalid log type: ${logType}`);
+    const n = clampInt(lines, 100, 1, 5000);
     try {
-      const output = await this.executeCommand(`tail -n ${lines} ${logFile}`);
-      
+      const output = await this.executeCommand(`tail -n ${n} ${logFile}`);
       return output
         .split('\n')
-        .filter(line => line.trim())
-        .map(line => {
-          // Parse log line (format may vary)
+        .filter((line) => line.trim())
+        .map((line) => {
           const timestampMatch = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
           const levelMatch = line.match(/\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b/);
-          
           return {
             timestamp: timestampMatch ? timestampMatch[1] : '',
             level: levelMatch ? levelMatch[1] : 'INFO',
@@ -253,23 +242,19 @@ export class OdooShSSHClient {
   }
 
   /**
-   * Execute Odoo shell command
+   * Run Python in `odoo-bin shell` on the build. The code travels base64-encoded, so it is never
+   * parsed by any shell. Without ODOO_SH_DATABASE, odoo-bin uses the build's configured database.
    */
   async executeOdooShell(pythonCode: string): Promise<string> {
-    // Write Python code to a temporary file and execute via odoo-bin shell
-    const escapedCode = pythonCode.replace(/'/g, "'\\''");
-    const command = `cd ~/src/odoo && echo '${escapedCode}' | ./odoo-bin shell -d production --no-http`;
-    
+    const b64 = Buffer.from(pythonCode, 'utf8').toString('base64');
+    const db = this.config.odooDatabase ? ` -d ${shellQuote(this.config.odooDatabase)}` : '';
     try {
-      return await this.executeCommand(command);
+      return await this.executeCommand(`printf %s ${shellQuote(b64)} | base64 -d | odoo-bin shell${db} --no-http`);
     } catch (err) {
       throw new Error(`Odoo shell execution failed: ${(err as Error).message}`);
     }
   }
 
-  /**
-   * Get system information
-   */
   async getSystemInfo(): Promise<Record<string, string>> {
     const commands = {
       hostname: 'hostname',
@@ -277,108 +262,71 @@ export class OdooShSSHClient {
       disk: 'df -h ~',
       memory: 'free -h',
       python: 'python3 --version',
-      odoo: 'cd ~/src/odoo && ./odoo-bin --version 2>&1 | head -n 1',
+      odoo: 'odoo-bin --version 2>&1 | head -n 1',
     };
-
     const results: Record<string, string> = {};
-
     for (const [key, cmd] of Object.entries(commands)) {
       try {
-        results[key] = await this.executeCommand(cmd);
+        results[key] = (await this.executeCommand(cmd)).trim();
       } catch (err) {
         results[key] = `Error: ${(err as Error).message}`;
       }
     }
-
     return results;
   }
 
-  /**
-   * Trigger a new build (via git push)
-   */
+  /** Trigger a new build: empty commit on the branch and push. */
   async triggerBuild(branch: string): Promise<string> {
-    // Create an empty commit and push to trigger build
-    await this.executeCommand(`cd ~/src/user && git checkout ${branch}`);
-    const output = await this.executeCommand(
-      'cd ~/src/user && git commit --allow-empty -m "Trigger build from MCP" && git push origin HEAD'
+    const b = shellQuote(assertBranch(branch));
+    return await this.executeCommand(
+      `${USER_SRC} && git checkout ${b} && git commit --allow-empty -m 'Trigger build from MCP' && git push origin HEAD`
     );
-    return output;
   }
 
-  /**
-   * Get Git status
-   */
   async getGitStatus(): Promise<string> {
-    return await this.executeCommand('cd ~/src/user && git status');
+    return await this.executeCommand(`${USER_SRC} && git status`);
   }
 
-  /**
-   * Create or update a file in the repository
-   */
   async writeFile(filePath: string, content: string): Promise<string> {
-    // Escape content for shell - use base64 encoding to avoid escaping issues
-    const base64Content = Buffer.from(content).toString('base64');
-    const command = `cd ~/src/user && echo '${base64Content}' | base64 -d > ${filePath}`;
-    return await this.executeCommand(command);
+    const path = shellQuote(assertRelativePath(filePath));
+    const b64 = shellQuote(Buffer.from(content, 'utf8').toString('base64'));
+    return await this.executeCommand(`${USER_SRC} && printf %s ${b64} | base64 -d > ${path}`);
   }
 
-  /**
-   * Read a file from the repository
-   */
   async readFile(filePath: string): Promise<string> {
-    return await this.executeCommand(`cd ~/src/user && cat ${filePath}`);
+    return await this.executeCommand(`${USER_SRC} && cat -- ${shellQuote(assertRelativePath(filePath))}`);
   }
 
-  /**
-   * List files in directory
-   */
   async listFiles(dirPath: string = '.'): Promise<string> {
-    return await this.executeCommand(`cd ~/src/user && ls -la ${dirPath}`);
+    return await this.executeCommand(`${USER_SRC} && ls -la -- ${shellQuote(assertRelativePath(dirPath))}`);
   }
 
-  /**
-   * Create directory
-   */
   async createDirectory(dirPath: string): Promise<string> {
-    return await this.executeCommand(`cd ~/src/user && mkdir -p ${dirPath}`);
+    return await this.executeCommand(`${USER_SRC} && mkdir -p -- ${shellQuote(assertRelativePath(dirPath))}`);
   }
 
-  /**
-   * Git add files
-   */
   async gitAdd(files: string | string[] = '.'): Promise<string> {
-    const fileList = Array.isArray(files) ? files.join(' ') : files;
-    return await this.executeCommand(`cd ~/src/user && git add ${fileList}`);
+    const list = (Array.isArray(files) ? files : [files]).map((f) => shellQuote(assertRelativePath(f)));
+    if (list.length === 0) throw new Error('No files to add');
+    return await this.executeCommand(`${USER_SRC} && git add -- ${list.join(' ')}`);
   }
 
-  /**
-   * Git commit
-   */
   async gitCommit(message: string): Promise<string> {
-    const escapedMessage = message.replace(/'/g, "'\\''");
-    return await this.executeCommand(`cd ~/src/user && git commit -m '${escapedMessage}'`);
+    if (!message.trim()) throw new Error('Commit message is required');
+    return await this.executeCommand(`${USER_SRC} && git commit -m ${shellQuote(message)}`);
   }
 
-  /**
-   * Git push
-   */
   async gitPush(branch?: string): Promise<string> {
-    const pushTarget = branch ? `origin ${branch}` : 'origin HEAD';
-    return await this.executeCommand(`cd ~/src/user && git push ${pushTarget}`);
+    const target = branch ? shellQuote(assertBranch(branch)) : 'HEAD';
+    return await this.executeCommand(`${USER_SRC} && git push origin ${target}`);
   }
 
-  /**
-   * Switch branch
-   */
   async gitCheckout(branch: string, createNew: boolean = false): Promise<string> {
-    const flag = createNew ? '-b' : '';
-    return await this.executeCommand(`cd ~/src/user && git checkout ${flag} ${branch}`);
+    const flag = createNew ? '-b ' : '';
+    return await this.executeCommand(`${USER_SRC} && git checkout ${flag}${shellQuote(assertBranch(branch))}`);
   }
 
-  /**
-   * Git pull
-   */
   async gitPull(): Promise<string> {
-    return await this.executeCommand('cd ~/src/user && git pull');
+    return await this.executeCommand(`${USER_SRC} && git pull --ff-only`);
   }
 }
