@@ -30,6 +30,39 @@
 - **🔄 Git Pull**: Sync changes from remote
 - **🛠️ AI-Assisted Development**: Let AI agents build complete Odoo modules
 
+## 🐳 Docker + Claude Code (recommended)
+
+The image is published automatically to GHCR on every push to `main` and on `v*` tags:
+`ghcr.io/elevateinformatics/odoo-sh-mcp-server:latest`.
+
+### 1. Connect to Odoo.sh
+
+1. Create a **dedicated key without passphrase** (the server runs non-interactively):
+   `ssh-keygen -t ed25519 -f ~/.ssh/odoosh_mcp -N "" -C "odoo-sh-mcp"`
+2. In Odoo.sh: click your GitHub avatar (top right) → **Profile** → paste `odoosh_mcp.pub` under **Add a key manually**.
+3. Open the branch in Odoo.sh and copy its SSH command, e.g.
+   `ssh 25004381@myorg-myrepo-staging-25004381.dev.odoo.com` → `ODOO_SH_SSH_USER=25004381`, `ODOO_SH_SSH_HOST=myorg-myrepo-staging-25004381.dev.odoo.com`.
+4. Test it once by hand: `ssh -i ~/.ssh/odoosh_mcp 25004381@myorg-myrepo-staging-25004381.dev.odoo.com "hostname"`.
+
+> ⚠️ The build ID is part of both user and host and **changes with every new build** of the branch. After a rebuild, update the two values.
+> SSH access requires the matching access rights on the project; production requires admin rights.
+
+### 2. Register it in Claude Code
+
+```bash
+claude mcp add odoo-sh-staging -- docker run -i --rm   -e ODOO_SH_SSH_HOST=myorg-myrepo-staging-25004381.dev.odoo.com   -e ODOO_SH_SSH_USER=25004381   -v "$HOME/.ssh/odoosh_mcp:/keys/id:ro"   -v odoo-sh-mcp-known-hosts:/home/node/.ssh   ghcr.io/elevateinformatics/odoo-sh-mcp-server:latest
+```
+
+- The key is mounted read-only; the entrypoint copies it with `0600` inside the container (Windows mounts are world-readable and OpenSSH would refuse them).
+- The named volume keeps `known_hosts` between runs (host keys are pinned on first use).
+- If the package is private: `gh auth token | docker login ghcr.io -u <github-user> --password-stdin` (token needs `read:packages`).
+
+### 3. Read-only by default
+
+`ODOO_SH_READ_ONLY=true` (default) exposes only read tools (project, branches, history, databases, logs, system info, git status, read/list files).
+`execute_odoo_shell`, `write_file`, `git_*` and `trigger_build` appear only with `-e ODOO_SH_READ_ONLY=false`.
+**Never enable write mode against a production build:** `execute_odoo_shell` runs arbitrary Python with full ORM access.
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
